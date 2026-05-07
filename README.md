@@ -90,13 +90,7 @@ us.example.com
 记录值：你的服务器公网 IPv4
 ```
 
-如果你使用的是通配符域名，例如：
-
-```text
-*.example.com
-```
-
-也建议给具体节点单独设置 A 记录，例如：
+给具体节点单独设置 A 记录，例如：
 
 ```text
 jp.example.com
