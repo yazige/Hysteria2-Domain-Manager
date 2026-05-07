@@ -87,8 +87,25 @@ EOF_LIMITS
 
     echo -e "${YELLOW}${PREFIX} 正在部署 Hysteria 2 核心...${NC}"
     if [ ! -f "/usr/local/bin/hysteria" ]; then
-        wget -q -O /usr/local/bin/hysteria https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64
-        chmod +x /usr/local/bin/hysteria
+ARCH=$(uname -m)
+
+case "$ARCH" in
+    x86_64|amd64)
+        HY2_ARCH="amd64"
+        ;;
+    aarch64|arm64)
+        HY2_ARCH="arm64"
+        ;;
+    *)
+        echo -e "${RED}❌ 不支持的系统架构: ${ARCH}${NC}"
+        return 1
+        ;;
+esac
+
+if [ ! -f "/usr/local/bin/hysteria" ]; then
+    wget -q -O /usr/local/bin/hysteria "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY2_ARCH}"
+    chmod +x /usr/local/bin/hysteria
+fi
     fi
 
     mkdir -p /etc/hysteria
