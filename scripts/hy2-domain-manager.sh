@@ -8,6 +8,28 @@ RED='\033[0;31m'
 NC='\033[0m'
 PREFIX="**"
 
+# ================= 基础环境检查 =================
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}❌ 请使用 root 用户运行，或使用 sudo bash 执行本脚本。${NC}"
+    exit 1
+fi
+
+if ! command -v apt-get >/dev/null 2>&1; then
+    echo -e "${RED}❌ 当前系统不支持 apt-get。本脚本仅支持 Debian / Ubuntu 系统。${NC}"
+    exit 1
+fi
+
+if ! command -v systemctl >/dev/null 2>&1; then
+    echo -e "${RED}❌ 当前系统不支持 systemctl。本脚本需要 systemd 环境。${NC}"
+    exit 1
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+    echo -e "${YELLOW}⚠️ 未检测到 curl，正在安装...${NC}"
+    apt-get update -y -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl >/dev/null 2>&1
+fi
+
 # ================= 优化参数：硬件保护与防风控 =================
 PORT_RANGE="20000-20200"
 CLIENT_UP="20"
