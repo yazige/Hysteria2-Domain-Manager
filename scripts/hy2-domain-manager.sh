@@ -30,30 +30,30 @@ if ! command -v curl >/dev/null 2>&1; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl >/dev/null 2>&1
 fi
 
-# ================= 优化参数：硬件保护与防风控 =================
-PORT_RANGE="20000-20200"
-CLIENT_UP="20"
-CLIENT_DOWN="50"
-SERVER_BW="400 mbps"
+# ================= 交互式域名检测与环境搭建 =================
+function prepare_env_with_domain() {
+    echo -e "\n${YELLOW}🚨 域名配置：请确保你已将二级域名解析到本机IP！${NC}"
+    read -p "👉 请输入完整域名 (例如 jp.abc.xyz): " DOMAIN
+    if [ -z "$DOMAIN" ]; then echo -e "${RED}❌ 域名为空，中止。${NC}"; sleep 2; return 1; fi
 
-# ================= 辅助函数：环境依赖与网络优化 =================
-function prepare_env_and_optimize() {
-    echo -e "${YELLOW}${PREFIX} 正在检测并清理可能冲突的老旧 Hysteria 服务...${NC}"
-    if systemctl is-active --quiet hysteria; then systemctl stop hysteria 2>/dev/null || true; fi
-    if systemctl is-active --quiet hysteria-server; then systemctl stop hysteria-server 2>/dev/null || true; fi
-    systemctl disable hysteria 2>/dev/null || true
+    echo -e "${CYAN}正在检查域名解析...${NC}"
+    PUBLIC_IP=$(curl -4 -s --connect-timeout 5 icanhazip.com)
+    RESOLVED_IP=$(ping -c 1 -W 2 $DOMAIN 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
 
-    echo -e "${YELLOW}${PREFIX} 正在更新组件并获取 IP...${NC}"
-    apt-get update -y -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl wget openssl iptables iptables-persistent netfilter-persistent ufw > /dev/null 2>&1
-
-    PUBLIC_IP=$(curl -4 -s --connect-timeout 5 icanhazip.com || curl -4 -s --connect-timeout 5 ifconfig.me)
-    if [ -z "$PUBLIC_IP" ]; then
-        echo -e "${RED}${PREFIX} ❌ 无法获取公网 IP，请检查 VPS 网络！${NC}"
-        exit 1
+    if [ "$RESOLVED_IP" == "$PUBLIC_IP" ]; then
+        echo -e "${GREEN}✅ 解析正常 ($PUBLIC_IP)。${NC}"
+    else
+        echo -e "${RED}⚠️ 警告: 域名解析IP ($RESOLVED_IP) 与本机 ($PUBLIC_IP) 不符！${NC}"
+        read -p "是否强制继续申请证书? (y/n): " force_cont
+        if [[ "$force_cont" != "y" && "$force_cont" != "Y" ]]; then return 1; fi
     fi
 
-    echo -e "${YELLOW}${PREFIX} 正在配置 2G 虚拟内存 (Swap)...${NC}"
+    echo -e "${YELLOW}${PREFIX} 正在清理环境、配置Swap与底层优化...${NC}"
+    systemctl stop hysteria-server 2>/dev/null || true
+    apt-get update -y -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl wget socat openssl iptables ufw > /dev/null 2>&1
+
+    # Swap 兜底
     SWAP_TOTAL=$(free -m | awk '/^Swap:/{print $2}')
     if [ -z "$SWAP_TOTAL" ] || [ "$SWAP_TOTAL" -lt 1900 ]; then
         swapoff -a 2>/dev/null; rm -f /swapfile
@@ -62,30 +62,35 @@ function prepare_env_and_optimize() {
         grep -q "/swapfile" /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
     fi
 
-    echo -e "${YELLOW}${PREFIX} 正在启用原生 BBR+FQ 与 UDP 16MB 扩容...${NC}"
+    # BBR+并发优化
     cat << SYSCTL_EOF > /etc/sysctl.d/99-hysteria.conf
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
-net.core.rmem_default = 4194304
-net.core.wmem_default = 4194304
 fs.file-max = 1048576
 SYSCTL_EOF
     sysctl --system > /dev/null 2>&1
-
-    echo -e "${YELLOW}${PREFIX} 正在破除系统全局并发连接数...${NC}"
-    cat << EOF_LIMITS > /etc/security/limits.d/99-hysteria.conf
-* soft nofile 1048576
-* hard nofile 1048576
-root soft nofile 1048576
-root hard nofile 1048576
-EOF_LIMITS
     sed -i 's/.*DefaultLimitNOFILE.*/DefaultLimitNOFILE=1048576/g' /etc/systemd/system.conf 2>/dev/null
-    sed -i 's/.*DefaultLimitNOFILE.*/DefaultLimitNOFILE=1048576/g' /etc/systemd/user.conf 2>/dev/null
-    systemctl daemon-reexec
 
-    echo -e "${YELLOW}${PREFIX} 正在部署 Hysteria 2 核心...${NC}"
+    echo -e "${YELLOW}${PREFIX} 放行防火墙 (80用于证书申请)...${NC}"
+    ufw allow 80/tcp 2>/dev/null || true
+    ufw allow 443/tcp 2>/dev/null || true
+    ufw allow 443/udp 2>/dev/null || true
+    ufw allow ${PORT_RANGE}/udp 2>/dev/null || true
+
+    echo -e "${YELLOW}${PREFIX} 启动 ACME 自动签发证书...${NC}"
+    mkdir -p /etc/hysteria
+    curl -s https://get.acme.sh | sh > /dev/null 2>&1
+    ~/.acme.sh/acme.sh --upgrade --auto-upgrade > /dev/null 2>&1
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt > /dev/null 2>&1
+    systemctl stop nginx 2>/dev/null || true
+
+    ~/.acme.sh/acme.sh --issue -d "${DOMAIN}" --standalone -k ec-256 --force
+    if [ $? -ne 0 ]; then echo -e "${RED}❌ 证书申请失败！${NC}"; sleep 3; return 1; fi
+    ~/.acme.sh/acme.sh --installcert -d "${DOMAIN}" --fullchain-file /etc/hysteria/server.crt --key-file /etc/hysteria/server.key --ecc --force > /dev/null 2>&1
+    echo -e "${GREEN}✅ 证书安装成功！${NC}"
+
     if [ ! -f "/usr/local/bin/hysteria" ]; then
 ARCH=$(uname -m)
 
@@ -107,14 +112,10 @@ if [ ! -f "/usr/local/bin/hysteria" ]; then
     chmod +x /usr/local/bin/hysteria
 fi
     fi
-
-    mkdir -p /etc/hysteria
-    if [ ! -f "/etc/hysteria/server.key" ]; then
-        openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/hysteria/server.key -out /etc/hysteria/server.crt -days 3650 -subj "/CN=bing.com" > /dev/null 2>&1
-    fi
+    return 0
 }
 
-function configure_systemd_and_firewall() {
+function configure_systemd() {
     cat << EOF_SERVICE > /etc/systemd/system/hysteria-server.service
 [Unit]
 Description=Hysteria 2 Server
@@ -131,27 +132,18 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF_SERVICE
-
     systemctl daemon-reload
-    echo -e "${YELLOW}${PREFIX} 正在配置安全防火墙放行规则...${NC}"
-    ufw allow 443/tcp 2>/dev/null || true
-    ufw allow 443/udp 2>/dev/null || true
-    ufw allow ${PORT_RANGE}/udp 2>/dev/null || true
     systemctl enable hysteria-server.service > /dev/null 2>&1
     systemctl restart hysteria-server.service
     sleep 2
 }
 
-# ================= A. 单用户安装 =================
+# ================= A. 单用户安装 (真域名) =================
 function install_single() {
-    clear
-    echo -e "${CYAN}${PREFIX} =========================================================${NC}"
-    echo -e "${CYAN}${PREFIX} Hysteria 2 团队版 (单用户) - 优化版${NC}"
-    echo -e "${CYAN}${PREFIX} =========================================================${NC}"
+    clear; echo -e "${CYAN}单用户部署 (真域名模式)...${NC}"
+    prepare_env_with_domain || return
+    PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
     
-    PASSWORD=$(tr -dc 'A-Za-z0-9!_.-' </dev/urandom | head -c 20)
-    prepare_env_and_optimize
-
     cat << EOF2 > /etc/hysteria/config.yaml
 listen: :443,${PORT_RANGE}
 tls:
@@ -178,58 +170,39 @@ bandwidth:
   up: ${SERVER_BW}
   down: ${SERVER_BW}
 EOF2
-
-    configure_systemd_and_firewall
-
-    echo -e "${GREEN}🎉 部署大功告成！直接将以下配置分发即可：${NC}\n"
-    echo -e "${YELLOW}【1. 手机端：Shadowrocket (小火箭) 节点链接】${NC}"
-    echo -e "\n${GREEN}hysteria2://${PASSWORD}@${PUBLIC_IP}:443/?mport=${PORT_RANGE}&sni=bing.com&obfs=salamander&obfsParam=${PASSWORD}&insecure=1#Team-HY2-Node${NC}\n"
+    configure_systemd
+    clear; echo -e "${GREEN}🎉 部署完成！以下为节点直连与配置块：${NC}\n"
+    echo -e "${YELLOW}【手机端直连链接 (无不安全提示)】${NC}"
+    echo -e "${GREEN}hysteria2://${PASSWORD}@${DOMAIN}:443/?mport=${PORT_RANGE}&sni=${DOMAIN}&obfs=salamander&obfsParam=${PASSWORD}#Team-HY2-Node${NC}\n"
     
-    echo -e "${YELLOW}【2. 电脑端：Clash Verge (Windows/Mac) 配置文件】${NC}"
+    echo -e "${YELLOW}【电脑端 Clash 代理块】${NC}"
     cat << EOF3
 proxies:
   - name: "Team-HY2-Node"
     type: hysteria2
-    server: ${PUBLIC_IP}
+    server: ${DOMAIN}
     port: 443
     ports: ${PORT_RANGE}
     password: ${PASSWORD}
-    sni: bing.com
-    skip-cert-verify: true
+    sni: ${DOMAIN}
+    skip-cert-verify: false
     obfs: salamander
     obfs-password: ${PASSWORD}
     up: ${CLIENT_UP}
     down: ${CLIENT_DOWN}
-
-proxy-groups:
-  - name: "🚀 节点选择"
-    type: select
-    proxies:
-      - "Team-HY2-Node"
-
-rules:
-  - DOMAIN-SUFFIX,amazon.co.jp,🚀 节点选择
-  - DOMAIN-SUFFIX,sellercentral.amazon.co.jp,🚀 节点选择
-  - MATCH,DIRECT
 EOF3
-    echo -e "\n${CYAN}💡 提示：冲突已自动解决，防火墙已打通，原生端口跳跃已激活！${NC}"
-    echo ""; read -n 1 -s -r -p "按任意键返回主菜单..."
+    echo ""; read -n 1 -s -r -p "按任意键返回..."
 }
 
-# ================= B. 多用户独立账号安装 =================
+# ================= B. 多用户独立账号安装 (真域名) =================
 function install_multi() {
-    clear
-    echo -e "${CYAN}${PREFIX} =========================================================${NC}"
-    echo -e "${CYAN}${PREFIX} Hysteria 2 多用户独立账号版 - 优化版${NC}"
-    echo -e "${CYAN}${PREFIX} =========================================================${NC}"
-    
-    read -p "👉 请输入要创建的用户数量 (默认回车=10，建议≤20): " USER_COUNT
-    USER_COUNT=${USER_COUNT:-10}
-
-    prepare_env_and_optimize
+    clear; echo -e "${CYAN}多用户部署 (真域名防封锁模式)...${NC}"
+    read -p "👉 请输入要创建的用户数量 (默认15): " USER_COUNT
+    USER_COUNT=${USER_COUNT:-15}
+    prepare_env_with_domain || return
 
     OBFS_PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
-    echo "PUBLIC_IP=${PUBLIC_IP}" > /etc/hysteria/.env_multi
+    echo "DOMAIN=${DOMAIN}" > /etc/hysteria/.env_multi
     echo "OBFS_PASSWORD=${OBFS_PASSWORD}" >> /etc/hysteria/.env_multi
 
     cat << EOF2_HEAD > /etc/hysteria/config.yaml
@@ -253,8 +226,7 @@ EOF2_HEAD
 
     declare -a M_NAMES; declare -a M_PASSES
     for i in $(seq 1 $USER_COUNT); do
-        UNAME="user${i}"
-        UPASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10)
+        UNAME="user${i}"; UPASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10)
         M_NAMES[$i]=$UNAME; M_PASSES[$i]=$UPASS
         echo "    ${UNAME}: ${UPASS}" >> /etc/hysteria/config.yaml
     done
@@ -269,128 +241,82 @@ bandwidth:
   up: ${SERVER_BW}
   down: ${SERVER_BW}
 EOF2_TAIL
+    configure_systemd
 
-    configure_systemd_and_firewall
-
-    clear
-    echo -e "${GREEN}🎉 多用户部署大功告成！${NC}\n"
-    
-    echo -e "${YELLOW}【1. 手机端：各成员专属链接 (Shadowrocket/v2rayN)】${NC}"
+    clear; echo -e "${GREEN}🎉 多用户防封锁版本大功告成！${NC}\n"
     for i in $(seq 1 $USER_COUNT); do
-        name="${M_NAMES[$i]}"
-        pass="${M_PASSES[$i]}"
+        name="${M_NAMES[$i]}"; pass="${M_PASSES[$i]}"
         echo -e "👤 用户 ${CYAN}[${name}]${NC} :"
-        echo -e "${GREEN}hysteria2://${name}:${pass}@${PUBLIC_IP}:443/?mport=${PORT_RANGE}&sni=bing.com&obfs=salamander&obfsParam=${OBFS_PASSWORD}&insecure=1#HY2-${name}${NC}\n"
-    done
-    
-    echo -e "${YELLOW}【2. 电脑端：Clash Verge 各成员独立配置文件】${NC}"
-    for i in $(seq 1 $USER_COUNT); do
-        name="${M_NAMES[$i]}"
-        pass="${M_PASSES[$i]}"
-        echo -e "--------------------------------------------------------"
-        echo -e " 👇 👇 👇 给成员 ${CYAN}[${name}]${NC} 的完整 Clash 配置 👇 👇 👇"
-        echo -e "--------------------------------------------------------"
+        echo -e "${GREEN}hysteria2://${name}:${pass}@${DOMAIN}:443/?mport=${PORT_RANGE}&sni=${DOMAIN}&obfs=salamander&obfsParam=${OBFS_PASSWORD}#HY2-${name}${NC}"
+        echo -e " 👇 Clash 组装配置块 👇"
         cat << EOF_YAML_SINGLE
-proxies:
   - name: "HY2-${name}"
     type: hysteria2
-    server: ${PUBLIC_IP}
+    server: ${DOMAIN}
     port: 443
     ports: ${PORT_RANGE}
     password: "${name}:${pass}"
-    sni: bing.com
-    skip-cert-verify: true
+    sni: ${DOMAIN}
+    skip-cert-verify: false
     obfs: salamander
     obfs-password: ${OBFS_PASSWORD}
     up: ${CLIENT_UP}
     down: ${CLIENT_DOWN}
-
-proxy-groups:
-  - name: "🚀 节点选择"
-    type: select
-    proxies:
-      - "HY2-${name}"
-
-rules:
-  - DOMAIN-SUFFIX,amazon.co.jp,🚀 节点选择
-  - DOMAIN-SUFFIX,sellercentral.amazon.co.jp,🚀 节点选择
-  - MATCH,DIRECT
 EOF_YAML_SINGLE
         echo -e "\n"
     done
     echo ""; read -n 1 -s -r -p "按任意键返回主菜单..."
 }
 
-# ================= C. 修改更新多用户密码 =================
+# ================= C & D. 改密与调优 =================
 function update_multi_user() {
-    clear
-    echo -e "${CYAN}${PREFIX} 修改/更新多用户账号密码${NC}"
+    clear; echo -e "${CYAN}修改多用户密码...${NC}"
     if [ ! -f "/etc/hysteria/config.yaml" ] || ! grep -q "type: userpass" /etc/hysteria/config.yaml; then
-        echo -e "${RED}❌ 未找到配置文件或非多用户模式！${NC}"; read -n 1 -s -r -p "按任意键返回..."; return
+        echo -e "${RED}❌ 当前不是多用户模式！${NC}"; read -n 1 -s -r -p "按任意键返回..."; return
     fi
     source /etc/hysteria/.env_multi 2>/dev/null
-    PUBLIC_IP=${PUBLIC_IP:-$(curl -4 -s icanhazip.com)}
-
     declare -a u_names; declare -a u_passes; count=0
     users_raw=$(awk '/^[[:space:]]*userpass:/{flag=1; next} /^[a-zA-Z]/{flag=0} flag {print}' /etc/hysteria/config.yaml | grep ":")
     while IFS=":" read -r name pass; do
         name=$(echo "$name" | tr -d ' '); pass=$(echo "$pass" | tr -d ' ')
         count=$((count+1)); u_names[$count]=$name; u_passes[$count]=$pass
-        echo -e " [${CYAN}${count}${NC}] 用户: ${GREEN}${name}${NC} \t| 密码: ${YELLOW}${pass}${NC}"
+        echo -e " [${CYAN}${count}${NC}] 用户: ${GREEN}${name}${NC} | 密码: ${YELLOW}${pass}${NC}"
     done <<< "$users_raw"
 
-    echo ""
-    read -p "👉 请输入修改编号 (1-$count, 0返回): " sel_idx
+    echo ""; read -p "👉 请输入修改编号 (1-$count, 0返回): " sel_idx
     if [[ "$sel_idx" -ge 1 && "$sel_idx" -le "$count" ]]; then
         target_user=${u_names[$sel_idx]}
         read -p "👉 输入新密码 (回车随机): " new_pass
         new_pass=${new_pass:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10)}
         sed -i "s/^[[:space:]]*${target_user}:.*/    ${target_user}: ${new_pass}/" /etc/hysteria/config.yaml
         systemctl restart hysteria-server.service
-        
-        clear
-        echo -e "${GREEN}✅ ${target_user} 密码已更新！${NC}\n"
-        users_raw_updated=$(awk '/^[[:space:]]*userpass:/{flag=1; next} /^[a-zA-Z]/{flag=0} flag {print}' /etc/hysteria/config.yaml | grep ":")
-        while IFS=":" read -r name pass; do
-            name=$(echo "$name" | tr -d ' '); pass=$(echo "$pass" | tr -d ' ')
-            echo -e "🔗 链接: ${GREEN}hysteria2://${name}:${pass}@${PUBLIC_IP}:443/?mport=${PORT_RANGE}&sni=bing.com&obfs=salamander&obfsParam=${OBFS_PASSWORD}&insecure=1#HY2-${name}${NC}"
-        done <<< "$users_raw_updated"
+        echo -e "${GREEN}✅ 密码已更新！新链接：${NC}"
+        echo -e "${GREEN}hysteria2://${target_user}:${new_pass}@${DOMAIN}:443/?mport=${PORT_RANGE}&sni=${DOMAIN}&obfs=salamander&obfsParam=${OBFS_PASSWORD}#HY2-${target_user}${NC}"
     fi
     echo ""; read -n 1 -s -r -p "按任意键返回主菜单..."
 }
 
-# ================= D. 老节点底层网络调优 =================
 function optimize_old_node() {
-    clear
-    echo -e "${CYAN}${PREFIX} =========================================================${NC}"
-    echo -e "${CYAN}${PREFIX} 老节点无损热升级方案 - [Swap + BBR + UDP + 并发解锁]${NC}"
-    echo -e "${CYAN}${PREFIX} =========================================================${NC}"
-    prepare_env_and_optimize
+    clear; echo -e "${CYAN}正在执行底层网络调优检测...${NC}"
     systemctl restart hysteria-server.service 2>/dev/null
-
-    echo -e "\n${CYAN}=========================================================${NC}"
-    echo -e "${CYAN}📋 老节点究极形态升级验证清单 (CheckList)${NC}"
-    echo -e "${CYAN}=========================================================${NC}"
     FINAL_SWAP=$(free -m | awk '/^Swap:/{print $2}')
-    if [ -n "$FINAL_SWAP" ] && [ "$FINAL_SWAP" -ge 1900 ]; then echo -e "${GREEN}[✔] 内存兜底: 2GB 保护档已就绪。${NC}"; else echo -e "${RED}[❌] 内存兜底: 失败${NC}"; fi
+    if [ -n "$FINAL_SWAP" ] && [ "$FINAL_SWAP" -ge 1900 ]; then echo -e "${GREEN}[✔] 内存兜底正常${NC}"; else echo -e "${RED}[❌] 内存兜底失败${NC}"; fi
     BBR_STATUS=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
-    if [[ "$BBR_STATUS" == "bbr" ]]; then echo -e "${GREEN}[✔] 拥塞控制: BBR 算法已激活。${NC}"; else echo -e "${RED}[❌] 拥塞控制: 失败${NC}"; fi
-    UDP_RMEM=$(sysctl net.core.rmem_max | awk '{print $3}')
-    if [ "$UDP_RMEM" -eq 16777216 ]; then echo -e "${GREEN}[✔] 极速防漏: 16MB 级 UDP 缓冲区已扩容。${NC}"; else echo -e "${RED}[❌] 极速防漏: 失败${NC}"; fi
+    if [[ "$BBR_STATUS" == "bbr" ]]; then echo -e "${GREEN}[✔] BBR激活正常${NC}"; else echo -e "${RED}[❌] BBR失败${NC}"; fi
     echo -e "${CYAN}=========================================================${NC}\n"
-    read -n 1 -s -r -p "按任意键返回主菜单..."
+    read -n 1 -s -r -p "按任意键返回..."
 }
 
 # ================= 主菜单 =================
 while true; do
     clear
     echo -e "${CYAN}=================================================================${NC}"
-    echo -e "${CYAN}🚀 Hysteria 2 管理面板 (原版复刻架构师优化版)${NC}"
+    echo -e "${CYAN}🚀 Hysteria 2 真域名交互管理面板 (多节点组装版)${NC}"
     echo -e "${CYAN}=================================================================${NC}"
-    echo -e " ${GREEN}A.${NC} 一键部署 (单用户版)"
-    echo -e " ${GREEN}B.${NC} 多用户独立账号部署"
-    echo -e " ${YELLOW}C.${NC} 修改/更新多用户账号密码"
-    echo -e " ${YELLOW}D.${NC} 老节点底层网络优化"
+    echo -e " ${GREEN}A.${NC} 部署单用户 (交互填域名)"
+    echo -e " ${GREEN}B.${NC} 部署多用户 (交互填域名)"
+    echo -e " ${YELLOW}C.${NC} 修改多用户密码"
+    echo -e " ${YELLOW}D.${NC} 底层网络优化检测"
     echo -e " ${RED}0.${NC} 退出脚本"
     echo -e "${CYAN}=================================================================${NC}"
     read -p "👉 请输入选项 [A/B/C/D/0]: " menu_choice
